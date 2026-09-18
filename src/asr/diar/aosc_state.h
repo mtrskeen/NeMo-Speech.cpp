@@ -32,6 +32,9 @@ struct DiarGeometry {
     // The "offline" preset still uses AOSC streaming with larger chunks and caches.
     static DiarGeometry riva_streaming() { return {}; }
     static DiarGeometry riva_offline() { return {312, 100, 100, 100, 0, 0}; }
+    static DiarGeometry nemotron3_low() { return {264, 264, 9, 222, 0, 4}; }
+    static DiarGeometry nemotron3_ulow() { return {264, 264, 3, 222, 0, 1}; }
+    static DiarGeometry nemotron3_offline() { return {264, 40, 340, 300, 0, 40}; }
     // Throws std::invalid_argument for unknown names.
     static DiarGeometry preset(const std::string& name);
 
@@ -45,7 +48,7 @@ struct DiarGeometry {
 // then its probability is folded into the strongest established channel.
 class ChannelBirthGate {
    public:
-    explicit ChannelBirthGate(int n_spk);
+    explicit ChannelBirthGate(int n_spk, double sec_per_frame = 0.08);
 
     void reset();
     void append(const std::vector<float>& raw, std::vector<float>& timeline);
@@ -57,6 +60,7 @@ class ChannelBirthGate {
     void push_raw(const float* probs);
 
     int n_spk_;
+    int time_scale_ = 1;
     int64_t frame_ = 0;
     std::vector<uint8_t> established_;
     std::vector<int> clean_frames_;
@@ -67,7 +71,7 @@ class ChannelBirthGate {
 
 class AoscState {
    public:
-    AoscState(const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim);
+    AoscState(const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim, const float* learnable_sil_emb = nullptr);
 
     // One streaming update after a model chunk.
     //   chunk_embs: (t3, emb_dim) pre-encode embeddings of the whole window
@@ -96,7 +100,9 @@ class AoscState {
     DiarGeometry geo_;
     DiarScoringConfig sc_;
     int n_spk_;
+    int time_scale_ = 1;
     int emb_dim_;
+    bool has_learnable_sil_ = false;
 
     std::vector<float> spkcache_;        // spk_frames_ x emb_dim
     std::vector<float> spkcache_preds_;  // spk_frames_ x n_spk (empty until seeded)

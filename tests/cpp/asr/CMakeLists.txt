@@ -72,3 +72,9 @@ endif()
 
 add_executable(asr_c_dlopen ${CMAKE_SOURCE_DIR}/tests/c/asr_c_dlopen.c)
 target_link_libraries(asr_c_dlopen PRIVATE ${CMAKE_DL_LIBS})
+
+add_executable(test_nemotron3_offline test_nemotron3_offline.cpp)
+target_link_libraries(test_nemotron3_offline PRIVATE nemo_speech_asr)
+
+add_executable(test_nemotron3_streaming test_nemotron3_streaming.cpp)
+target_link_libraries(test_nemotron3_streaming PRIVATE nemo_speech_asr)

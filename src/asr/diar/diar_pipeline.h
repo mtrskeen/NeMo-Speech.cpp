@@ -18,6 +18,7 @@
 #include "aosc_state.h"
 #include "fe.h"
 #include "parameter_parser.h"
+#include "nemotron3_model.h"
 #include "sortformer_model.h"
 
 namespace nemo_speech::asr {
@@ -61,31 +62,76 @@ struct DiarConfig {
     }
 };
 
+struct DiarModelConfig {
+    int sample_rate = 16000;
+    float window_size = 0.025f;
+    float window_stride = 0.01f;
+    int n_fft = 512;
+    int n_mels = 128;
+    float preemph = 0.97f;
+    float log_zero_guard = 5.9604645e-8f;
+
+    int num_speakers = 4;
+    DiarScoringConfig scoring;
+
+    struct {
+        int d_model = 512;
+        int subsampling_factor = 8;
+        int pos_emb_max_len = 5000;
+    } encoder;
+
+    bool is_nemotron3 = false;
+    bool high_resolution = false;
+    double seconds_per_frame = 0.08;
+};
+
 // Shared, stream-independent resources: the model Session + its FE config.
 class DiarModel {
    public:
     DiarModel(
         ggml_runtime::BackendManager& bm, const std::string& gguf_path,
         const BatchingConfig& batching = {});
+    ~DiarModel();
 
-    SortformerModel& model() { return model_; }
-    MelSpectrogramExtractor& fe() { return fe_; }
-    const SortformerModelConfig& cfg() const { return model_.cfg(); }
-    BatchMetrics batch_metrics() const { return model_.batch_metrics(); }
+    SortformerModel* sortformer() { return sortformer_.get(); }
+    Nemotron3Model* nemotron3() { return nemotron3_.get(); }
+    SortformerModel& model() {
+        if (!sortformer_)
+            throw std::runtime_error("DiarModel: underlying model is not a Sortformer model");
+        return *sortformer_;
+    }
 
-    // Full offline diarization: one forward pass over the whole file with
-    // full self-attention and NO streaming state (NeMo streaming_mode=False;
-    // the per-chunk graph with empty spkcache/fifo is exactly that forward).
-    // Returns per-frame speaker probabilities, (n_frames x n_spk) frame-major,
-    // one frame per 80 ms. Bounded by the rel-pos table: audio longer than
-    // pos_emb_max_len encoder frames (5000 = ~6.6 min) throws - use
-    // DiarStream for long-form.
+    MelSpectrogramExtractor& fe() { return *fe_; }
+    const DiarModelConfig& cfg() const { return cfg_; }
+    bool is_nemotron3() const { return cfg_.is_nemotron3; }
+    int num_speakers() const { return cfg_.num_speakers; }
+    double seconds_per_frame() const { return cfg_.seconds_per_frame; }
+    BatchMetrics batch_metrics() const;
+
+    struct ChunkOutput {
+        std::vector<float> preds;
+        std::vector<float> preds_downsampled;
+        std::vector<float> chunk_embs;
+        int total_frames = 0;
+        int chunk_frames = 0;
+    };
+
+    ChunkOutput run_chunk(
+        const float* mel, int t_mel, const float* spkcache, int spkcache_frames, const float* fifo,
+        int fifo_frames);
+
+    int subsampled_len(int t_mel) const;
+    const std::vector<float>& learnable_sil_emb() const { return learnable_sil_emb_; }
+
     std::vector<float> diarize_offline(const float* audio, size_t n_samples, int64_t* n_frames);
 
    private:
-    SortformerModel model_;
+    DiarModelConfig cfg_;
     MelSpecConfig fe_cfg_;
-    MelSpectrogramExtractor fe_;
+    std::unique_ptr<SortformerModel> sortformer_;
+    std::unique_ptr<Nemotron3Model> nemotron3_;
+    std::unique_ptr<MelSpectrogramExtractor> fe_;
+    std::vector<float> learnable_sil_emb_;
 };
 
 // Per-speaker segmentation parameters, NeMo ts_vad_post_processing semantics

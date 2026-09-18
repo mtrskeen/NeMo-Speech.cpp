@@ -151,14 +151,12 @@ Diarizer::diarize(
     if (mode == DiarizationMode::Offline) {
         int64_t frames = 0;
         const auto probabilities = model_->diarize_offline(audio_samples, audio_size, &frames);
-        const auto& config = model_->cfg();
-        const double seconds_per_frame =
-            config.encoder.subsampling_factor * static_cast<double>(config.window_stride);
+        const double seconds_per_frame = model_->seconds_per_frame();
         result.segments = diar_segments_from_probs(
-            probabilities.data(), frames, config.num_speakers, seconds_per_frame, segmentation);
+            probabilities.data(), frames, model_->num_speakers(), seconds_per_frame, segmentation);
         result.frame_probabilities = probabilities;
         result.frame_count = frames;
-        result.num_speakers = config.num_speakers;
+        result.num_speakers = model_->num_speakers();
         result.seconds_per_frame = seconds_per_frame;
     } else {
         auto stream = streaming_diarize();
@@ -191,8 +189,7 @@ Diarizer::num_speakers() const {
 
 double
 Diarizer::seconds_per_frame() const {
-    const auto& config = model_->cfg();
-    return config.encoder.subsampling_factor * static_cast<double>(config.window_stride);
+    return model_->seconds_per_frame();
 }
 
 BatchMetrics

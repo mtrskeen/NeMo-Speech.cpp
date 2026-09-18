@@ -9,7 +9,7 @@
 using namespace nemo_speech::asr;
 
 static MelSpecConfig
-make_fe_cfg(const SortformerModelConfig& c) {
+make_fe_cfg(const DiarModelConfig& c) {
     MelSpecConfig fe;
     fe.sample_rate = c.sample_rate;
     fe.n_fft = c.n_fft;
@@ -18,40 +18,117 @@ make_fe_cfg(const SortformerModelConfig& c) {
     fe.window_stride = c.window_stride;
     fe.preemph = c.preemph;
     fe.log_zero_guard = c.log_zero_guard;
-    // NeMo torch.stft parity (see MelSpecConfig): centered window, symmetric
-    // hann. The ASR models keep the legacy placement they were validated with.
     fe.stft_center_window = true;
     fe.hann_periodic = false;
     return fe;
 }
 
 DiarModel::DiarModel(
-    ggml_runtime::BackendManager& bm, const std::string& gguf_path, const BatchingConfig& batching)
-    : model_(bm, gguf_path, batching), fe_cfg_(make_fe_cfg(model_.cfg())),
-      fe_(fe_cfg_, /*bm=*/nullptr) {  // CPU FFT path, same choice as AsrModel
-    const int n_bins = fe_cfg_.n_fft / 2 + 1;
-    fe_.set_mel_basis(model_.mel_basis().data(), fe_cfg_.n_mels, n_bins);
+    ggml_runtime::BackendManager& bm, const std::string& gguf_path, const BatchingConfig& batching) {
+    ggml_runtime::GGUFLoader probe(gguf_path);
+    std::string arch = probe.get_str("general.architecture", "sortformer_diar");
+    if (arch == "nemotron3_diar") {
+        nemotron3_ = std::make_unique<Nemotron3Model>(bm, gguf_path, batching);
+        const auto& c = nemotron3_->cfg();
+        cfg_.sample_rate = c.sample_rate;
+        cfg_.window_size = c.window_size;
+        cfg_.window_stride = c.window_stride;
+        cfg_.n_fft = c.n_fft;
+        cfg_.n_mels = c.n_mels;
+        cfg_.preemph = c.preemph;
+        cfg_.log_zero_guard = c.log_zero_guard;
+        cfg_.num_speakers = c.num_speakers;
+        cfg_.scoring = c.scoring;
+        cfg_.encoder.d_model = c.transformer.d_model;
+        cfg_.encoder.subsampling_factor = c.subsampling_factor;
+        cfg_.encoder.pos_emb_max_len = c.transformer.pos_emb_max_len;
+        cfg_.is_nemotron3 = true;
+        cfg_.high_resolution = c.high_resolution;
+        cfg_.seconds_per_frame = c.high_resolution ? c.window_stride : (c.subsampling_factor * c.window_stride);
+        learnable_sil_emb_ = nemotron3_->learnable_sil_emb();
+
+        fe_cfg_ = make_fe_cfg(cfg_);
+        fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, /*bm=*/nullptr);
+        const int n_bins = fe_cfg_.n_fft / 2 + 1;
+        fe_->set_mel_basis(nemotron3_->mel_basis().data(), fe_cfg_.n_mels, n_bins);
+    } else {
+        sortformer_ = std::make_unique<SortformerModel>(bm, gguf_path, batching);
+        const auto& c = sortformer_->cfg();
+        cfg_.sample_rate = c.sample_rate;
+        cfg_.window_size = c.window_size;
+        cfg_.window_stride = c.window_stride;
+        cfg_.n_fft = c.n_fft;
+        cfg_.n_mels = c.n_mels;
+        cfg_.preemph = c.preemph;
+        cfg_.log_zero_guard = c.log_zero_guard;
+        cfg_.num_speakers = c.num_speakers;
+        cfg_.scoring = c.scoring;
+        cfg_.encoder.d_model = c.encoder.d_model;
+        cfg_.encoder.subsampling_factor = c.encoder.subsampling_factor;
+        cfg_.encoder.pos_emb_max_len = c.encoder.pos_emb_max_len;
+        cfg_.is_nemotron3 = false;
+        cfg_.high_resolution = false;
+        cfg_.seconds_per_frame = c.encoder.subsampling_factor * c.window_stride;
+
+        fe_cfg_ = make_fe_cfg(cfg_);
+        fe_ = std::make_unique<MelSpectrogramExtractor>(fe_cfg_, /*bm=*/nullptr);
+        const int n_bins = fe_cfg_.n_fft / 2 + 1;
+        fe_->set_mel_basis(sortformer_->mel_basis().data(), fe_cfg_.n_mels, n_bins);
+    }
+}
+
+DiarModel::~DiarModel() = default;
+
+DiarModel::ChunkOutput
+DiarModel::run_chunk(
+    const float* mel, int t_mel, const float* spkcache, int spkcache_frames, const float* fifo,
+    int fifo_frames) {
+    ChunkOutput out;
+    if (cfg_.is_nemotron3) {
+        auto r = nemotron3_->run_chunk(mel, t_mel, spkcache, spkcache_frames, fifo, fifo_frames);
+        out.preds = std::move(r.preds);
+        out.preds_downsampled = std::move(r.preds_downsampled);
+        out.chunk_embs = std::move(r.chunk_embs);
+        out.total_frames = r.total_frames;
+        out.chunk_frames = r.chunk_frames;
+    } else {
+        auto r = sortformer_->run_chunk(mel, t_mel, spkcache, spkcache_frames, fifo, fifo_frames);
+        out.preds = std::move(r.preds);
+        out.chunk_embs = std::move(r.chunk_embs);
+        out.total_frames = r.total_frames;
+        out.chunk_frames = r.chunk_frames;
+    }
+    return out;
+}
+
+int
+DiarModel::subsampled_len(int t_mel) const {
+    if (cfg_.is_nemotron3)
+        return nemotron3_->subsampled_len(t_mel);
+    return sortformer_->subsampled_len(t_mel);
+}
+
+BatchMetrics
+DiarModel::batch_metrics() const {
+    if (cfg_.is_nemotron3)
+        return nemotron3_->batch_metrics();
+    return sortformer_->batch_metrics();
 }
 
 std::vector<float>
 DiarModel::diarize_offline(const float* audio, size_t n_samples, int64_t* n_frames) {
-    // NeMo's offline path (streaming_mode=False, process_signal) peak-
-    // normalizes the waveform before FE: x * 1/(max(x) + eps), eps=1e-3.
-    // The streaming path does NOT - this is offline-only.
     float peak = n_samples ? audio[0] : 0.f;
     for (size_t i = 1; i < n_samples; i++) peak = std::max(peak, audio[i]);
     const float gain = 1.0f / (peak + 1e-3f);
     std::vector<float> scaled(n_samples);
     for (size_t i = 0; i < n_samples; i++) scaled[i] = audio[i] * gain;
 
-    // Whole-file mel in one FE call (reflect-left at stream start; the FE
-    // zero-pads the right edge internally, NeMo pad_mode="constant").
     std::vector<float> mel;
     int t_mel = 0;
-    fe_.compute(scaled.data(), n_samples, mel, t_mel, /*reflect_left=*/true, /*normalize=*/false);
+    fe_->compute(scaled.data(), n_samples, mel, t_mel, /*reflect_left=*/true, /*normalize=*/false);
 
-    const int t_enc = model_.subsampled_len(t_mel);
-    const int max_enc = model_.cfg().encoder.pos_emb_max_len;
+    const int t_enc = subsampled_len(t_mel);
+    const int max_enc = cfg_.encoder.pos_emb_max_len;
     if (t_enc > max_enc) {
         throw std::invalid_argument(
             "diarize_offline: " + std::to_string(t_enc) +
@@ -61,27 +138,34 @@ DiarModel::diarize_offline(const float* audio, size_t n_samples, int64_t* n_fram
             " min); use DiarStream for long-form audio");
     }
 
-    // One forward with empty spkcache/fifo == NeMo streaming_mode=False.
-    auto out = model_.run_chunk(mel.data(), t_mel, nullptr, 0, nullptr, 0);
+    auto out = run_chunk(mel.data(), t_mel, nullptr, 0, nullptr, 0);
     if (n_frames)
-        *n_frames = out.total_frames;
+        *n_frames = static_cast<int64_t>(out.preds.size()) / cfg_.num_speakers;
     return std::move(out.preds);
 }
 
 DiarStream::DiarStream(DiarModel& model, const DiarGeometry& geometry)
     : m_(model), geo_(geometry), n_spk_(model.cfg().num_speakers),
       sub_(model.cfg().encoder.subsampling_factor),
-      sec_per_frame_(
-          model.cfg().encoder.subsampling_factor * static_cast<double>(model.cfg().window_stride)),
-      state_(geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model), birth_gate_(n_spk_) {
+      sec_per_frame_(model.seconds_per_frame()),
+      state_(
+          geo_, model.cfg().scoring, n_spk_, model.cfg().encoder.d_model,
+          model.learnable_sil_emb().empty() ? nullptr : model.learnable_sil_emb().data()),
+      birth_gate_(n_spk_, sec_per_frame_) {
     n_mels_ = m_.fe().n_mels();
     geo_.validate(
         n_spk_, model.cfg().scoring.sil_frames_per_spk, model.cfg().encoder.pos_emb_max_len);
+    if (sec_per_frame_ < 0.04) {
+        compact_trigger_frames_ = 120000;
+        compact_retain_frames_ = 60000;
+    }
 }
 
 void
 DiarStream::reset() {
-    state_ = AoscState(geo_, m_.cfg().scoring, n_spk_, m_.cfg().encoder.d_model);
+    state_ = AoscState(
+        geo_, m_.cfg().scoring, n_spk_, m_.cfg().encoder.d_model,
+        m_.learnable_sil_emb().empty() ? nullptr : m_.learnable_sil_emb().data());
     birth_gate_.reset();
     audio_buf_.clear();
     audio_base_ = 0;
@@ -175,15 +259,29 @@ DiarStream::run_one_chunk(bool force, bool final_flush) {
         throw std::runtime_error("DiarStream: mel window trimmed too aggressively");
     const float* mel = mel_buf_.data() + (w0 - mel_base_) * m_.fe().n_mels();
 
-    auto out = m_.model().run_chunk(
+    auto out = m_.run_chunk(
         mel, t_mel, state_.spkcache_frames() ? state_.spkcache().data() : nullptr,
         state_.spkcache_frames(), state_.fifo_frames() ? state_.fifo().data() : nullptr,
         state_.fifo_frames());
 
     const int lc_enc = static_cast<int>(std::lround(lc_mel / static_cast<double>(sub_)));
     const int rc_enc = static_cast<int>(std::ceil(rc_mel / static_cast<double>(sub_)));
-    auto emitted =
-        state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
+
+    std::vector<float> emitted;
+    if (m_.is_nemotron3()) {
+        const int state_enc_frames = out.total_frames - out.chunk_frames;
+        state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds_downsampled.data(), lc_enc, rc_enc);
+
+        const int sub_factor = m_.cfg().encoder.subsampling_factor;
+        const int valid_enc = out.chunk_frames - lc_enc - rc_enc;
+        const int start_hr = (state_enc_frames + lc_enc) * sub_factor;
+        const int valid_hr = valid_enc * sub_factor;
+        const auto hr_begin = out.preds.begin() + static_cast<size_t>(start_hr) * n_spk_;
+        emitted.assign(hr_begin, hr_begin + static_cast<size_t>(valid_hr) * n_spk_);
+    } else {
+        emitted = state_.update(out.chunk_embs.data(), out.chunk_frames, out.preds.data(), lc_enc, rc_enc);
+    }
+
     birth_gate_.append(emitted, probs_);
     maybe_compact();
     mel_consumed_ = end;

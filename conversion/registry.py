@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .source import list_hugging_face_files, read_nemo_config, resolve_nemo_source
 
-ARCHITECTURES = ("asr", "diarization", "pnc", "vad", "tts", "codec", "nmt", "s2s")
+ARCHITECTURES = ("asr", "diarization", "nemotron3_diar", "pnc", "vad", "tts", "codec", "nmt", "s2s")
 
 
 @dataclass
@@ -38,6 +38,12 @@ class ConversionRequest:
 
 def _architecture_from_config(config: dict) -> str:
     target = str(config.get("target", config.get("_target_", ""))).lower()
+    enc = config.get("encoder") or {}
+    if "sortformer_modules" in config and (
+        str(enc.get("self_attention_model", "")).lower() == "rope"
+        or int(config.get("max_num_of_spks", 0) or 0) > 4
+    ):
+        return "nemotron3_diar"
     if "sortformer" in target or "sortformer_modules" in config:
         return "diarization"
     if "punctuationcapitalization" in target or ("punct_head" in config and "capit_head" in config):
@@ -112,6 +118,7 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
     defaults = {
         "asr": "q8_0",
         "diarization": "f32",
+        "nemotron3_diar": "f32",
         "pnc": "q8_0",
         "vad": "f32",
         "tts": "f16",
@@ -139,6 +146,7 @@ def _normalized_outtype(architecture: str, outtype: str) -> str:
             "nvfp4",
             "mxfp4",
         },
+        "nemotron3_diar": {"f32", "f16"},
         "pnc": {"f16", "bf16", "q8_0"},
         "vad": {"f32"},
         "tts": {"f16", "f32"},
@@ -202,6 +210,11 @@ def convert_model(request: ConversionRequest) -> str:
 
         assert checkpoint is not None
         diarization.convert(checkpoint, request.outfile, "fp16" if outtype == "f16" else outtype)
+    elif architecture == "nemotron3_diar":
+        from . import nemotron3_diar
+
+        assert checkpoint is not None
+        nemotron3_diar.convert(checkpoint, request.outfile, outtype)
     elif architecture == "pnc":
         from . import pnc
 

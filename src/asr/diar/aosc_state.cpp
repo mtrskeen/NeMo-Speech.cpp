@@ -48,7 +48,7 @@ topk_column(const std::vector<float>& scores, int n, int n_spk, int spk, int k) 
 }
 }  // namespace
 
-ChannelBirthGate::ChannelBirthGate(int n_spk) : n_spk_(n_spk) {
+ChannelBirthGate::ChannelBirthGate(int n_spk, double sec_per_frame) : n_spk_(n_spk), time_scale_(sec_per_frame > 0.0 && sec_per_frame < 0.04 ? static_cast<int>(std::round(0.08 / sec_per_frame)) : 1) {
     if (n_spk_ <= 0)
         throw std::invalid_argument("ChannelBirthGate: n_spk must be positive");
     reset();
@@ -87,8 +87,8 @@ ChannelBirthGate::observe(const float* probs) {
             clean_frames_[winner]++;
         if (probs[winner] >= kBirthFading && established_prob <= kEstablishedFading)
             fading_frames_[winner]++;
-        if (clean_frames_[winner] >= kBirthCleanFrames ||
-            fading_frames_[winner] >= kBirthFadingFrames) {
+        if (clean_frames_[winner] >= kBirthCleanFrames * time_scale_ ||
+            fading_frames_[winner] >= kBirthFadingFrames * time_scale_) {
             established_[winner] = true;
             changed = true;
         }
@@ -117,7 +117,7 @@ ChannelBirthGate::relabel(float* probs) const {
 void
 ChannelBirthGate::push_raw(const float* probs) {
     raw_ring_.insert(raw_ring_.end(), probs, probs + n_spk_);
-    const size_t cap = static_cast<size_t>(kBirthRevisionFrames) * n_spk_;
+    const size_t cap = static_cast<size_t>(kBirthRevisionFrames * time_scale_) * n_spk_;
     if (raw_ring_.size() > cap)
         raw_ring_.erase(raw_ring_.begin(), raw_ring_.begin() + n_spk_);
 }
@@ -157,6 +157,12 @@ DiarGeometry::preset(const std::string& name) {
         return riva_streaming();
     if (name == "offline")
         return riva_offline();
+    if (name == "low" || name == "nemotron3-low")
+        return nemotron3_low();
+    if (name == "ulow" || name == "nemotron3-ulow")
+        return nemotron3_ulow();
+    if (name == "nemotron3-offline")
+        return nemotron3_offline();
     throw std::invalid_argument(
         "unknown diarizer geometry preset '" + name + "' (expected streaming | offline)");
 }
@@ -188,15 +194,23 @@ DiarGeometry::validate(int n_spk, int sil_frames_per_spk, int pos_emb_max_len) c
 }
 
 AoscState::AoscState(
-    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim)
+    const DiarGeometry& geo, const DiarScoringConfig& scoring, int n_spk, int emb_dim,
+    const float* learnable_sil_emb)
     : geo_(geo), sc_(scoring), n_spk_(n_spk), emb_dim_(emb_dim) {
-    mean_sil_emb_.assign(emb_dim_, 0.f);
+    if (learnable_sil_emb) {
+        mean_sil_emb_.assign(learnable_sil_emb, learnable_sil_emb + emb_dim);
+        has_learnable_sil_ = true;
+    } else {
+        mean_sil_emb_.assign(emb_dim_, 0.f);
+        has_learnable_sil_ = false;
+    }
 }
 
 // NeMo `_get_silence_profile`: running mean embedding over frames whose
 // summed speaker activity is below sil_threshold.
 void
 AoscState::accumulate_silence(const float* embs, const float* preds, int n) {
+    if (has_learnable_sil_) return;
     int cnt = 0;
     std::vector<double> sum(emb_dim_, 0.0);
     for (int f = 0; f < n; f++) {
