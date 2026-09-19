@@ -453,27 +453,35 @@ class Nemotron3Model::Nemotron3Batcher {
         std::vector<float> d_pj(total_enc_frames * 192);
         std::vector<float> d_sb(total_enc_frames * 1536);
 
+        // A zero-length tensor has no host storage (data() may be null), but the
+        // runtime rejects an output with neither a host buffer nor a device
+        // destination. A short final chunk can round down to zero high-res
+        // frames, so give empty buffers one dummy element.
+        auto host_buffer = [](std::vector<float>& v) {
+            if (v.empty()) v.resize(1, 0.0f);
+            return v.data();
+        };
         std::vector<ggml_runtime::Session::Output> outputs(7);
         outputs[0].index = 0;
-        outputs[0].host_buffer = preds.data();
+        outputs[0].host_buffer = host_buffer(preds);
         outputs[0].nbytes = preds.size() * sizeof(float);
         outputs[1].index = 1;
-        outputs[1].host_buffer = embs.data();
+        outputs[1].host_buffer = host_buffer(embs);
         outputs[1].nbytes = embs.size() * sizeof(float);
         outputs[2].index = 2;
-        outputs[2].host_buffer = d_en.data();
+        outputs[2].host_buffer = host_buffer(d_en);
         outputs[2].nbytes = d_en.size() * sizeof(float);
         outputs[3].index = 3;
-        outputs[3].host_buffer = d_l0.data();
+        outputs[3].host_buffer = host_buffer(d_l0);
         outputs[3].nbytes = d_l0.size() * sizeof(float);
         outputs[4].index = 4;
-        outputs[4].host_buffer = d_fn.data();
+        outputs[4].host_buffer = host_buffer(d_fn);
         outputs[4].nbytes = d_fn.size() * sizeof(float);
         outputs[5].index = 5;
-        outputs[5].host_buffer = d_pj.data();
+        outputs[5].host_buffer = host_buffer(d_pj);
         outputs[5].nbytes = d_pj.size() * sizeof(float);
         outputs[6].index = 6;
-        outputs[6].host_buffer = d_sb.data();
+        outputs[6].host_buffer = host_buffer(d_sb);
         outputs[6].nbytes = d_sb.size() * sizeof(float);
         model_->session_->run(inputs, outputs);
 

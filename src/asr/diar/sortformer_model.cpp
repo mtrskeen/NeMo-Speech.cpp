@@ -264,12 +264,17 @@ class SortformerModel::SortformerBatcher {
         const size_t embs_item = static_cast<size_t>(t3) * d;
         std::vector<float> preds(preds_item * B);
         std::vector<float> embs(embs_item * B);
+        // See Nemotron3: an empty buffer must still carry a valid host pointer.
+        auto host_buffer = [](std::vector<float>& v) {
+            if (v.empty()) v.resize(1, 0.0f);
+            return v.data();
+        };
         std::vector<ggml_runtime::Session::Output> outputs(2);
         outputs[0].index = 0;
-        outputs[0].host_buffer = preds.data();
+        outputs[0].host_buffer = host_buffer(preds);
         outputs[0].nbytes = preds.size() * sizeof(float);
         outputs[1].index = 1;
-        outputs[1].host_buffer = embs.data();
+        outputs[1].host_buffer = host_buffer(embs);
         outputs[1].nbytes = embs.size() * sizeof(float);
         model_->session_->run(inputs, outputs);
 
